@@ -27,9 +27,9 @@ var destructiveEndpoints = []authCase{
 	{http.MethodPost, "/projects/migrate", `{"old_project":"a","new_project":"b"}`},
 }
 
-// safeEndpoints are read-only routes that must never require auth, even when
-// the token is set.
-var safeEndpoints = []authCase{
+// readEndpoints are routes that used to bypass auth. Every route is guarded now,
+// so they are only reachable without token when ENGRAM_HTTP_TOKEN is unset.
+var readEndpoints = []authCase{
 	{http.MethodGet, "/health", ""},
 	{http.MethodGet, "/observations/recent", ""},
 	{http.MethodGet, "/search?q=test", ""},
@@ -47,7 +47,7 @@ func TestOptionalAuth_NoToken(t *testing.T) {
 	st := newServerTestStore(t)
 	h := New(st, 0).Handler()
 
-	for _, tc := range destructiveEndpoints {
+	for _, tc := range append(append([]authCase{}, destructiveEndpoints...), readEndpoints...) {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
 			var body *strings.Reader
 			if tc.body != "" {
@@ -167,23 +167,31 @@ func TestOptionalAuth_WithToken_CorrectCredential(t *testing.T) {
 	}
 }
 
-// TestOptionalAuth_ReadEndpointsUnaffected verifies that read-only endpoints
-// remain accessible even when the token is set (no auth required for reads).
-func TestOptionalAuth_ReadEndpointsUnaffected(t *testing.T) {
+// TestOptionalAuth_ReadEndpointsAlsoGuarded verifies that read and health
+// endpoints are guarded too: the token now covers every route.
+func TestOptionalAuth_ReadEndpointsAlsoGuarded(t *testing.T) {
 	t.Setenv("ENGRAM_HTTP_TOKEN", "super-secret-token")
 
 	st := newServerTestStore(t)
 	h := New(st, 0).Handler()
 
-	for _, tc := range safeEndpoints {
+	for _, tc := range readEndpoints {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
 			req := httptest.NewRequest(tc.method, tc.path, nil)
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
 
+			if rec.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401 without token on %s %s, got %d",
+					tc.method, tc.path, rec.Code)
+			}
+
+			req.Header.Set("Authorization", "Bearer super-secret-token")
+			rec = httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
 			if rec.Code == http.StatusUnauthorized || rec.Code == http.StatusForbidden {
-				t.Fatalf("expected read endpoint to be accessible without token header, got %d for %s %s",
-					rec.Code, tc.method, tc.path)
+				t.Fatalf("expected access with correct token on %s %s, got %d",
+					tc.method, tc.path, rec.Code)
 			}
 		})
 	}

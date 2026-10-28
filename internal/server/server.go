@@ -18,6 +18,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Gentleman-Programming/engram/internal/diagnostic"
@@ -63,13 +64,22 @@ type SemanticRunnerFactory func(name string) (store.SemanticRunner, error)
 type SemanticPromptBuilder func(a, b store.ObservationSnippet) string
 
 type Server struct {
-	store      *store.Store
-	mux        *http.ServeMux
-	port       int
-	listen     func(network, address string) (net.Listener, error)
-	serve      func(net.Listener, http.Handler) error
-	onWrite    func() // called after successful local writes (for autosync notification)
-	syncStatus SyncStatusProvider
+	store  *store.Store
+	mux    *http.ServeMux
+	port   int
+	listen func(network, address string) (net.Listener, error)
+	serve  func(net.Listener, http.Handler) error
+
+	// expectedHost pins the Host header to the address this process actually
+	// listens on. DNS rebinding points an attacker domain at 127.0.0.1 while the
+	// browser keeps sending that domain in Host, so an exact match is the only
+	// check that survives it. Empty means "not pinned" (embedders/tests that
+	// serve Handler() themselves must call SetExpectedHost to opt in).
+	expectedHost string
+	hostMu       sync.RWMutex
+	guarded      http.Handler
+	onWrite      func() // called after successful local writes (for autosync notification)
+	syncStatus   SyncStatusProvider
 
 	// runnerFactory resolves a SemanticRunner by CLI name (read from ENGRAM_AGENT_CLI).
 	// When nil, semantic=true requests fail with 500.
@@ -125,12 +135,12 @@ func (s *Server) notifyWrite() {
 //
 // The token is read from the environment on every request so that the server
 // does not need to restart when the variable changes.
-func requireAuth(h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
+func requireAuth(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := os.Getenv("ENGRAM_HTTP_TOKEN")
 		if token == "" {
 			// No token configured → open access (zero-config default).
-			h(w, r)
+			h.ServeHTTP(w, r)
 			return
 		}
 
@@ -152,8 +162,45 @@ func requireAuth(h http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		h(w, r)
-	}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// enforceHost rejects requests whose Host header is not the pinned listener
+// address. It runs before the token check so a rebound request reports 403
+// (wrong host) instead of 401 (missing credential).
+func (s *Server) enforceHost(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		expected := s.pinnedHost()
+		if expected != "" && r.Host != expected {
+			jsonError(w, http.StatusForbidden, "untrusted host")
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// guard is the single choke point for every route: Host pinning first, then the
+// optional bearer token. Wrapping here, not per route, keeps a new route from
+// silently shipping unauthenticated.
+func (s *Server) guard(h http.Handler) http.Handler {
+	return s.enforceHost(requireAuth(h))
+}
+
+// SetExpectedHost pins the Host header value this server accepts. Production
+// Start() pins the real listener address; embedders serving Handler() directly
+// must call this to get the same protection.
+func (s *Server) SetExpectedHost(host string) {
+	s.hostMu.Lock()
+	s.expectedHost = strings.TrimSpace(host)
+	s.guarded = nil
+	s.hostMu.Unlock()
+}
+
+func (s *Server) pinnedHost() string {
+	s.hostMu.RLock()
+	defer s.hostMu.RUnlock()
+	return s.expectedHost
 }
 
 func (s *Server) Start() error {
@@ -171,12 +218,16 @@ func (s *Server) Start() error {
 	if err != nil {
 		return fmt.Errorf("engram server: listen %s: %w", addr, err)
 	}
+	s.SetExpectedHost(ln.Addr().String())
 	log.Printf("[engram] HTTP server listening on %s", addr)
-	return serveFn(ln, s.mux)
+	return serveFn(ln, s.Handler())
 }
 
 func (s *Server) Handler() http.Handler {
-	return s.mux
+	if s.guarded == nil {
+		s.guarded = s.guard(s.mux)
+	}
+	return s.guarded
 }
 
 func (s *Server) routes() {
@@ -187,7 +238,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /sessions/{id}/end", s.handleEndSession)
 	s.mux.HandleFunc("GET /sessions/recent", s.handleRecentSessions)
 	s.mux.HandleFunc("GET /sessions/{id}", s.handleGetSession)
-	s.mux.HandleFunc("DELETE /sessions/{id}", requireAuth(s.handleDeleteSession))
+	s.mux.HandleFunc("DELETE /sessions/{id}", s.handleDeleteSession)
 
 	// Observations
 	s.mux.HandleFunc("POST /observations", s.handleAddObservation)
@@ -195,7 +246,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /observations/passive", s.handlePassiveCapture)
 	s.mux.HandleFunc("GET /observations/recent", s.handleRecentObservations)
 	s.mux.HandleFunc("PATCH /observations/{id}", s.handleUpdateObservation)
-	s.mux.HandleFunc("DELETE /observations/{id}", requireAuth(s.handleDeleteObservation))
+	s.mux.HandleFunc("DELETE /observations/{id}", s.handleDeleteObservation)
 
 	// Search
 	s.mux.HandleFunc("GET /search", s.handleSearch)
@@ -212,14 +263,14 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /prompts", s.handleAddPrompt)
 	s.mux.HandleFunc("GET /prompts/recent", s.handleRecentPrompts)
 	s.mux.HandleFunc("GET /prompts/search", s.handleSearchPrompts)
-	s.mux.HandleFunc("DELETE /prompts/{id}", requireAuth(s.handleDeletePrompt))
+	s.mux.HandleFunc("DELETE /prompts/{id}", s.handleDeletePrompt)
 
 	// Context
 	s.mux.HandleFunc("GET /context", s.handleContext)
 
 	// Export / Import — sensitive: full data read and bulk mutation.
-	s.mux.HandleFunc("GET /export", requireAuth(s.handleExport))
-	s.mux.HandleFunc("POST /import", requireAuth(s.handleImport))
+	s.mux.HandleFunc("GET /export", s.handleExport)
+	s.mux.HandleFunc("POST /import", s.handleImport)
 
 	// Stats / diagnostics
 	s.mux.HandleFunc("GET /stats", s.handleStats)
@@ -227,7 +278,7 @@ func (s *Server) routes() {
 
 	// Project detection / migration
 	s.mux.HandleFunc("GET /project/current", s.handleCurrentProject)
-	s.mux.HandleFunc("POST /projects/migrate", requireAuth(s.handleMigrateProject))
+	s.mux.HandleFunc("POST /projects/migrate", s.handleMigrateProject)
 
 	// Sync status (degraded-state visibility for autosync)
 	s.mux.HandleFunc("GET /sync/status", s.handleSyncStatus)
