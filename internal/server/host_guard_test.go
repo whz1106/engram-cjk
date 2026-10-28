@@ -118,3 +118,54 @@ func TestStartPinsListenerHost(t *testing.T) {
 		t.Fatalf("expected 403 from the served handler for a foreign host, got %d", rec.Code)
 	}
 }
+
+// TestStartPinnedHostWithoutTokenRequiresAuth locks the production combination:
+// Start() pins the listener host AND the token is enforced, so a request that
+// matches the host still needs the bearer token.
+func TestStartPinnedHostWithoutTokenRequiresAuth(t *testing.T) {
+	t.Setenv("ENGRAM_HTTP_TOKEN", "super-secret-token")
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+
+	srv := New(nil, 0)
+	srv.listen = func(_, _ string) (net.Listener, error) { return ln, nil }
+	var captured http.Handler
+	srv.serve = func(_ net.Listener, h http.Handler) error {
+		captured = h
+		return nil
+	}
+	if err := srv.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	host := ln.Addr().String()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
+	req.Host = host
+	captured.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without token on the pinned host, got %d", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/health", nil)
+	req.Host = host
+	req.Header.Set("Authorization", "Bearer super-secret-token")
+	captured.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with token on the pinned host, got %d body=%q", rec.Code, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/health", nil)
+	req.Host = "attacker.example"
+	req.Header.Set("Authorization", "Bearer super-secret-token")
+	captured.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a foreign host with a valid token, got %d", rec.Code)
+	}
+}

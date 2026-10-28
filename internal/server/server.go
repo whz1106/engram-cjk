@@ -77,7 +77,6 @@ type Server struct {
 	// serve Handler() themselves must call SetExpectedHost to opt in).
 	expectedHost string
 	hostMu       sync.RWMutex
-	guarded      http.Handler
 	onWrite      func() // called after successful local writes (for autosync notification)
 	syncStatus   SyncStatusProvider
 
@@ -193,7 +192,6 @@ func (s *Server) guard(h http.Handler) http.Handler {
 func (s *Server) SetExpectedHost(host string) {
 	s.hostMu.Lock()
 	s.expectedHost = strings.TrimSpace(host)
-	s.guarded = nil
 	s.hostMu.Unlock()
 }
 
@@ -224,10 +222,9 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) Handler() http.Handler {
-	if s.guarded == nil {
-		s.guarded = s.guard(s.mux)
-	}
-	return s.guarded
+	// Built per call: the guard reads the pinned host under hostMu, so there is
+	// no shared handler value to cache or race with SetExpectedHost.
+	return s.guard(s.mux)
 }
 
 func (s *Server) routes() {
